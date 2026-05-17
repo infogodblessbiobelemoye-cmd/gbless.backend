@@ -2,42 +2,25 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'gbless-secret-key-2024';
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Database setup
-const db = new Database('bank.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    bankName TEXT,
-    accountName TEXT,
-    accountNumber TEXT UNIQUE,
-    balance REAL DEFAULT 0,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId INTEGER,
-    type TEXT NOT NULL,
-    amount REAL NOT NULL,
-    description TEXT,
-    recipient TEXT,
-    date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (userId) REFERENCES users (id)
-  );
-`);
+// Simple in-memory storage (will persist during runtime)
+let users = [];
+let transactions = [];
+let userIdCounter = 1;
+let txIdCounter = 1;
+
+// Generate account number
+function genAccountNumber() {
+  return 'GBL' + Date.now().toString().slice(-7) + Math.random().toString().slice(2, 4);
+}
 
 // Auth middleware
 function authenticate(req, res, next) {
@@ -52,14 +35,7 @@ function authenticate(req, res, next) {
   }
 }
 
-// Generate account number
-function genAccountNumber() {
-  return 'GBL' + Date.now().toString().slice(-7) + Math.random().toString().slice(2, 4);
-}
-
 // ========== AUTH ROUTES ==========
-
-// Signup
 app.post('/api/signup', (req, res) => {
   try {
     const { name, email, password, bankName, accountName, accountNumber } = req.body;
@@ -68,32 +44,45 @@ app.post('/api/signup', (req, res) => {
       return res.status(400).json({ error: 'Missing fields' });
     }
     
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) return res.status(400).json({ error: 'Email exists' });
+    if (users.find(u => u.email === email)) {
+      return res.status(400).json({ error: 'Email exists' });
+    }
     
     const hashed = bcrypt.hashSync(password, 10);
     const accNum = accountNumber || genAccountNumber();
     
-    const result = db.prepare(
-      'INSERT INTO users (name, email, password, bankName, accountName, accountNumber) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(name, email, hashed, bankName, accountName, accNum);
+    const newUser = {
+      id: userIdCounter++,
+      name, email, password: hashed,
+      bankName: bankName || 'GBLESS Bank',
+      accountName: accountName || name,
+      accountNumber: accNum,
+      balance: 0
+    };
     
-    const token = jwt.sign({ id: result.lastInsertRowid }, JWT_SECRET, { expiresIn: '7d' });
+    users.push(newUser);
+    
+    const token = jwt.sign({ id: newUser.id }, JWT_SECRET, { expiresIn: '7d' });
     
     res.json({
       token,
-      user: { id: result.lastInsertRowid, name, email, bankName, accountName, accountNumber: accNum, balance: 0 }
+      user: {
+        id: newUser.id, name, email,
+        bankName: newUser.bankName,
+        accountName: newUser.accountName,
+        accountNumber: accNum,
+        balance: 0
+      }
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Login
 app.post('/api/login', (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    const user = users.find(u => u.email === email);
     
     if (!user || !bcrypt.compareSync(password, user.password)) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -116,7 +105,7 @@ app.post('/api/login', (req, res) => {
 
 // ========== USER ROUTES ==========
 app.get('/api/user', authenticate, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const user = users.find(u => u.id === req.userId);
   if (!user) return res.status(404).json({ error: 'Not found' });
   res.json({
     id: user.id, name: user.name, email: user.email,
@@ -127,8 +116,11 @@ app.get('/api/user', authenticate, (req, res) => {
 
 // ========== TRANSACTIONS ==========
 app.get('/api/transactions', authenticate, (req, res) => {
-  const tx = db.prepare('SELECT * FROM transactions WHERE userId = ? ORDER BY date DESC LIMIT 20').all(req.userId);
-  res.json(tx);
+  const userTx = transactions
+    .filter(t => t.userId === req.userId)
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+    .slice(0, 20);
+  res.json(userTx);
 });
 
 // Deposit
@@ -136,10 +128,18 @@ app.post('/api/deposit', authenticate, (req, res) => {
   const { amount, description } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
   
-  db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(amount, req.userId);
-  db.prepare('INSERT INTO transactions (userId, type, amount, description) VALUES (?, ?, ?, ?)').run(req.userId, 'deposit', amount, description || 'Deposit');
+  const user = users.find(u => u.id === req.userId);
+  user.balance += amount;
   
-  const user = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.userId);
+  transactions.push({
+    id: txIdCounter++,
+    userId: req.userId,
+    type: 'deposit',
+    amount,
+    description: description || 'Deposit',
+    date: new Date().toISOString()
+  });
+  
   res.json({ balance: user.balance, message: 'Deposit successful' });
 });
 
@@ -148,62 +148,88 @@ app.post('/api/withdraw', authenticate, (req, res) => {
   const { amount, description } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
   
-  const user = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.userId);
+  const user = users.find(u => u.id === req.userId);
   if (amount > user.balance) return res.status(400).json({ error: 'Insufficient funds' });
   
-  db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(amount, req.userId);
-  db.prepare('INSERT INTO transactions (userId, type, amount, description) VALUES (?, ?, ?, ?)').run(req.userId, 'withdrawal', amount, description || 'Withdrawal');
+  user.balance -= amount;
   
-  const updated = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.userId);
-  res.json({ balance: updated.balance, message: 'Withdrawal successful' });
+  transactions.push({
+    id: txIdCounter++,
+    userId: req.userId,
+    type: 'withdrawal',
+    amount,
+    description: description || 'Withdrawal',
+    date: new Date().toISOString()
+  });
+  
+  res.json({ balance: user.balance, message: 'Withdrawal successful' });
 });
 
 // Transfer
 app.post('/api/transfer', authenticate, (req, res) => {
-  const { toAccount, amount, description, bankName } = req.body;
+  const { toAccount, amount, description } = req.body;
   if (!toAccount || !amount || amount <= 0) return res.status(400).json({ error: 'Invalid' });
   
-  const sender = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  const sender = users.find(u => u.id === req.userId);
   if (amount > sender.balance) return res.status(400).json({ error: 'Insufficient funds' });
   
-  const recipient = db.prepare('SELECT * FROM users WHERE accountNumber = ?').get(toAccount);
+  sender.balance -= amount;
   
-  db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(amount, req.userId);
-  db.prepare('INSERT INTO transactions (userId, type, amount, description, recipient) VALUES (?, ?, ?, ?, ?)').run(req.userId, 'transfer', amount, description || `Transfer to ${toAccount}`, toAccount);
+  transactions.push({
+    id: txIdCounter++,
+    userId: req.userId,
+    type: 'transfer',
+    amount,
+    description: description || `Transfer to ${toAccount}`,
+    recipient: toAccount,
+    date: new Date().toISOString()
+  });
   
+  const recipient = users.find(u => u.accountNumber === toAccount);
   if (recipient) {
-    db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(amount, recipient.id);
-    db.prepare('INSERT INTO transactions (userId, type, amount, description, recipient) VALUES (?, ?, ?, ?, ?)').run(recipient.id, 'deposit', amount, `Received from ${sender.name}`, sender.accountNumber);
+    recipient.balance += amount;
+    transactions.push({
+      id: txIdCounter++,
+      userId: recipient.id,
+      type: 'deposit',
+      amount,
+      description: `Received from ${sender.name}`,
+      date: new Date().toISOString()
+    });
   }
   
-  const updated = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.userId);
-  res.json({ balance: updated.balance, message: 'Transfer successful' });
+  res.json({ balance: sender.balance, message: 'Transfer successful' });
 });
 
-// Admin - all users
+// Admin
 app.get('/api/admin/users', authenticate, (req, res) => {
-  const users = db.prepare('SELECT id, name, email, bankName, accountName, accountNumber, balance FROM users').all();
-  res.json(users);
+  const userList = users.map(u => ({
+    id: u.id, name: u.name, email: u.email,
+    bankName: u.bankName, accountName: u.accountName,
+    accountNumber: u.accountNumber, balance: u.balance
+  }));
+  res.json(userList);
 });
 
-// Admin - simulate transfer
 app.post('/api/admin/transfer', authenticate, (req, res) => {
   const { fromEmail, toEmail, amount } = req.body;
   
-  const sender = db.prepare('SELECT * FROM users WHERE email = ?').get(fromEmail);
-  const recipient = db.prepare('SELECT * FROM users WHERE email = ?').get(toEmail);
+  const sender = users.find(u => u.email === fromEmail);
+  const recipient = users.find(u => u.email === toEmail);
   
   if (!sender || !recipient) return res.status(404).json({ error: 'User not found' });
   if (amount > sender.balance) return res.status(400).json({ error: 'Insufficient funds' });
   
-  db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(amount, sender.id);
-  db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(amount, recipient.id);
+  sender.balance -= amount;
+  recipient.balance += amount;
   
   res.json({ message: 'Transfer successful' });
 });
 
-// Serve frontend
-app.use(express.static(path.join(__dirname, 'public')));
+// Health check
+app.get('/api', (req, res) => {
+  res.json({ status: 'online', users: users.length, transactions: transactions.length });
+});
 
 app.listen(PORT, () => {
   console.log(`🏦 GBLESS Bank running on port ${PORT}`);
