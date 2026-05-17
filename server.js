@@ -1,39 +1,3 @@
-const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = 'gbless-secret-key-2024';
-
-app.use(cors());
-app.use(express.json());
-
-let users = [];
-let transactions = [];
-let uid = 1;
-let tid = 1;
-
-// Auth middleware
-function authenticate(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
-  try {
-    req.userId = jwt.verify(token, JWT_SECRET).id;
-    next();
-  } catch (e) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-}
-
-// Health check
-app.get('/api', (req, res) => {
-  res.json({ status: 'online', bank: 'GBLESS Trust Bank', users: users.length });
-});
-
-// ========== AUTH ==========
-app.post('/api/signup', (req, res) => {
   const { name, email, password, bankName, accountName, accountNumber } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
   if (users.find(u => u.email === email)) return res.status(400).json({ error: 'Email exists' });
@@ -124,6 +88,56 @@ app.get('/api/admin/users', authenticate, (req, res) => {
 });
 
 app.post('/api/admin/generate', authenticate, (req, res) => {
+  const { email, amount } = req.body;
+  const user = users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.balance += parseFloat(amount);
+  transactions.push({ id: tid++, userId: user.id, type: 'deposit', amount: parseFloat(amount), description: 'Admin generated funds', date: new Date().toISOString() });
+  res.json({ balance: user.balance, message: 'Funds generated' });
+});
+// ========== PAYSTACK BANK VERIFICATION ==========
+const PAYSTACK_KEY = 'sk_test_fd55dd219902761fb1c09cc422b61c78ab07d65f';
+
+app.post('/api/verify-account', authenticate, async (req, res) => {
+  const { accountNumber, bankCode } = req.body;
+  
+  if (!accountNumber || !bankCode) return res.status(400).json({ error: 'Missing fields' });
+  
+  try {
+    const response = await fetch(`https://api.paystack.co/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`, {
+      headers: { 'Authorization': `Bearer ${PAYSTACK_KEY}` }
+    });
+    const data = await response.json();
+    
+    if (data.status) {
+      res.json({ accountName: data.data.account_name, bankName: bankCode });
+    } else {
+      // Fallback to prefix detection
+      const prefixes = {
+        '044': 'Access Bank', '058': 'GTBank', '057': 'Zenith Bank', '011': 'First Bank',
+        '033': 'UBA', '032': 'Union Bank', '070': 'Fidelity Bank', '050': 'Ecobank',
+        '090': 'Kuda Bank', '101': 'PalmPay', '102': 'Opay', '103': 'Moniepoint'
+      };
+      res.json({ accountName: 'Account Holder', bankName: prefixes[bankCode] || 'Unknown Bank' });
+    }
+  } catch (e) {
+    res.json({ accountName: 'Account Holder (offline)', bankName: 'Detection offline' });
+  }
+});
+
+// Admin check middleware
+function adminOnly(req, res, next) {
+  const user = users.find(u => u.id === req.userId);
+  if (!user || user.email !== 'admin@gbless.com') return res.status(403).json({ error: 'Admin only' });
+  next();
+}
+
+// Protect admin routes
+app.get('/api/admin/users', authenticate, adminOnly, (req, res) => {
+  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, bankName: u.bankName, accountName: u.accountName, accountNumber: u.accountNumber, balance: u.balance })));
+});
+
+app.post('/api/admin/generate', authenticate, adminOnly, (req, res) => {
   const { email, amount } = req.body;
   const user = users.find(u => u.email === email);
   if (!user) return res.status(404).json({ error: 'User not found' });
