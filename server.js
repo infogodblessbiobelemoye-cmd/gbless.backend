@@ -2,13 +2,17 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Resend } = require('resend');
+const SibApiV3Sdk = require('sib-api-v3-sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = 'gbless-secret-key-2024';
-const resend = new Resend('re_ahwxmCHJ_DnV7P5ijD43hqoxXNaFcxdJ6');
-const ADMIN_EMAIL = 'your-email@gmail.com';
+
+// Brevo Setup
+const defaultClient = SibApiV3Sdk.ApiClient.instance;
+const apiKey = defaultClient.authentications['api-key'];
+apiKey.apiKey = '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';
+const transactionalEmailsApi = new SibApiV3Sdk.TransactionalEmailsApi();
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
@@ -49,14 +53,15 @@ function adminOnly(req, res, next) {
 
 async function sendEmail(to, subject, html) {
   try {
-    await resend.emails.send({
-      from: 'GBLESS Trust Bank <noreply@gblesstrustbank.com>',
-      to: ADMIN_EMAIL,
-      subject: subject,
-      html: html
-    });
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    sendSmtpEmail.sender = { name: 'GBLESS Trust Bank', email: 'noreply@gblesstrustbank.com' };
+    sendSmtpEmail.to = [{ email: to }];
+    sendSmtpEmail.subject = subject;
+    sendSmtpEmail.htmlContent = html;
+    await transactionalEmailsApi.sendTransacEmail(sendSmtpEmail);
+    console.log('Email sent to:', to);
   } catch (e) {
-    console.log('Email failed:', e.message);
+    console.log('Email error:', e.message);
   }
 }
 
@@ -80,19 +85,19 @@ app.post('/api/signup', (req, res) => {
     id: uid++, name, email, password: hashedPassword,
     bankName: 'GBLESS Trust Bank', accountName: name,
     accountNumber: Math.floor(1000000000 + Math.random() * 9000000000).toString(),
-    balance: 0, pin: null, pinAttempts: 0, pinLocked: false,
-    verified: false, verificationPin: hashedPin, tempVerificationPin: verificationPin
+    balance: 0, pin: hashedPin, pinAttempts: 0, pinLocked: false,
+    verified: false, verificationPin: hashedPin
   };
   users.push(newUser);
   
-  sendEmail(email, '🔐 GBLESS Trust Bank - Verification PIN', `
-    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
-      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+  sendEmail(email, 'GBLESS Trust Bank - Verification PIN', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;margin:0 auto;">
+      <h2 style="color:#1f6feb;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
       <h3 style="color:#f0f6fc;">Account Verification</h3>
       <p>Hello ${name},</p>
-      <p>Use the PIN below to verify your account:</p>
+      <p>Your verification PIN is:</p>
       <div style="background:#161b22;padding:20px;border-radius:8px;margin:15px 0;text-align:center;">
-        <h1 style="color:#00b4d8;font-size:36px;letter-spacing:10px;margin:0;">${verificationPin}</h1>
+        <h1 style="color:#1f6feb;font-size:36px;letter-spacing:10px;margin:0;">${verificationPin}</h1>
       </div>
       <p style="color:#8b949e;font-size:12px;">© 2024 GBLESS Trust Bank</p>
     </div>
@@ -108,11 +113,8 @@ app.post('/api/verify-account', authenticate, (req, res) => {
   const user = users.find(u => u.id === req.userId);
   if (!user) return res.status(404).json({ error: 'Not found' });
   if (user.verified) return res.status(400).json({ error: 'Already verified' });
-  if (!bcrypt.compareSync(pin, user.verificationPin)) return res.status(400).json({ error: 'Invalid verification PIN' });
-  
+  if (!bcrypt.compareSync(pin, user.verificationPin)) return res.status(400).json({ error: 'Invalid PIN' });
   user.verified = true;
-  user.pin = user.verificationPin;
-  user.tempVerificationPin = null;
   res.json({ success: true, message: 'Account verified!' });
 });
 
@@ -121,30 +123,16 @@ app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const user = users.find(u => u.email === email);
   if (!user || !bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
-  if (!user.verified) return res.status(403).json({ error: 'Account not verified. Check your email for PIN.' });
+  if (!user.verified) return res.status(403).json({ error: 'Account not verified. Check your email.' });
   const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, accountNumber: user.accountNumber, balance: user.balance, verified: user.verified } });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, accountNumber: user.accountNumber, balance: user.balance } });
 });
 
 // ========== USER ==========
 app.get('/api/user', authenticate, (req, res) => {
   const user = users.find(u => u.id === req.userId);
   if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: user.id, name: user.name, email: user.email, bankName: user.bankName, accountName: user.accountName, accountNumber: user.accountNumber, balance: user.balance, verified: user.verified });
-});
-
-// ========== VERIFY TRANSACTION PIN ==========
-app.post('/api/verify-pin', authenticate, (req, res) => {
-  const { pin } = req.body;
-  const user = users.find(u => u.id === req.userId);
-  if (user.pinLocked) return res.status(403).json({ error: 'PIN locked. Wait 5 minutes.' });
-  if (!bcrypt.compareSync(pin, user.pin)) {
-    user.pinAttempts++;
-    if (user.pinAttempts >= 3) { user.pinLocked = true; setTimeout(() => { user.pinLocked = false; user.pinAttempts = 0; }, 300000); }
-    return res.status(400).json({ error: 'Wrong PIN', attempts: user.pinAttempts });
-  }
-  user.pinAttempts = 0;
-  res.json({ success: true });
+  res.json({ id: user.id, name: user.name, email: user.email, bankName: user.bankName, accountName: user.accountName, accountNumber: user.accountNumber, balance: user.balance });
 });
 
 // ========== TRANSACTIONS ==========
@@ -170,15 +158,14 @@ app.post('/api/transfer', authenticate, (req, res) => {
     transactions.push({ id: tid++, userId: recipient.id, type: 'deposit', amount: parseFloat(amount), description: `Received from ${user.name}`, date: new Date().toISOString() });
   }
   
-  sendEmail(user.email, '💸 Debit Alert - GBLESS Trust Bank', `
-    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
-      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+  sendEmail(user.email, 'GBLESS Trust Bank - Debit Alert', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;margin:0 auto;">
+      <h2 style="color:#1f6feb;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
       <h3 style="color:#f85149;">Debit Alert: -$${amount.toFixed(2)}</h3>
       <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
         <p><strong>To:</strong> ${bankName} - ${toAccount}</p>
         <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
         <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
-        <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
       </div>
     </div>
   `);
@@ -186,7 +173,7 @@ app.post('/api/transfer', authenticate, (req, res) => {
   res.json({ balance: user.balance, message: 'Transfer successful' });
 });
 
-// ========== WITHDRAW WITH PRANK ==========
+// ========== WITHDRAW ==========
 app.post('/api/withdraw', authenticate, (req, res) => {
   const { amount, bankName, accountName, accountNumber, pin, withdrawalCode } = req.body;
   const user = users.find(u => u.id === req.userId);
@@ -197,11 +184,7 @@ app.post('/api/withdraw', authenticate, (req, res) => {
   if (!bankName || !accountName || !accountNumber) return res.status(400).json({ error: 'Missing bank details' });
   
   if (!withdrawalCode) {
-    return res.status(403).json({ 
-      error: 'AUTHORIZATION REQUIRED', 
-      message: 'This account requires a withdrawal authorization code.',
-      action: 'contact_support'
-    });
+    return res.status(403).json({ error: 'AUTHORIZATION REQUIRED', message: 'Contact customer care for withdrawal code.', action: 'contact_support' });
   }
   
   const code = withdrawalCodes.find(c => c.code === withdrawalCode && !c.used);
@@ -211,14 +194,13 @@ app.post('/api/withdraw', authenticate, (req, res) => {
   user.balance -= parseFloat(amount);
   transactions.push({ id: tid++, userId: req.userId, type: 'withdrawal', amount: parseFloat(amount), description: `Withdrawal to ${bankName}`, date: new Date().toISOString() });
   
-  sendEmail(user.email, '🏧 Withdrawal Confirmed - GBLESS Trust Bank', `
-    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
-      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+  sendEmail(user.email, 'GBLESS Trust Bank - Withdrawal Confirmed', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;margin:0 auto;">
+      <h2 style="color:#1f6feb;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
       <h3 style="color:#f85149;">Withdrawal: -$${amount.toFixed(2)}</h3>
       <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
         <p><strong>To:</strong> ${bankName} - ${accountNumber}</p>
         <p><strong>Account:</strong> ${accountName}</p>
-        <p><strong>Code:</strong> ${code.code}</p>
         <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
       </div>
     </div>
@@ -263,7 +245,7 @@ app.post('/api/admin/chat/reply', authenticate, adminOnly, (req, res) => {
 
 // ========== ADMIN ==========
 app.get('/api/admin/users', authenticate, adminOnly, (req, res) => {
-  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, accountNumber: u.accountNumber, balance: u.balance, verified: u.verified, pinLocked: u.pinLocked })));
+  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, accountNumber: u.accountNumber, balance: u.balance, verified: u.verified })));
 });
 
 app.post('/api/admin/generate', authenticate, adminOnly, (req, res) => {
@@ -273,15 +255,14 @@ app.post('/api/admin/generate', authenticate, adminOnly, (req, res) => {
   user.balance += parseFloat(amount);
   transactions.push({ id: tid++, userId: user.id, type: 'deposit', amount: parseFloat(amount), description: 'Corporate Payment', date: new Date().toISOString() });
   
-  sendEmail(email, '💰 Credit Alert - GBLESS Trust Bank', `
-    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
-      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+  sendEmail(user.email, 'GBLESS Trust Bank - Credit Alert', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;margin:0 auto;">
+      <h2 style="color:#1f6feb;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
       <h3 style="color:#3fb950;">Credit Alert: +$${amount.toFixed(2)}</h3>
       <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
         <p><strong>Sender:</strong> Corporate Payment</p>
         <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
         <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
-        <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
       </div>
     </div>
   `);
