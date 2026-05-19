@@ -1,36 +1,150 @@
-  const { name, email, password, bankName, accountName, accountNumber } = req.body;
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Resend } = require('resend');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = 'gbless-secret-key-2024';
+const resend = new Resend('re_ahwxmCHJ_DnV7P5ijD43hqoxXNaFcxdJ6');
+const ADMIN_EMAIL = 'your-email@gmail.com';
+
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(express.json());
+
+let users = [];
+let transactions = [];
+let chatMessages = [];
+let withdrawalCodes = [];
+let uid = 1;
+let tid = 1;
+let cid = 1;
+
+function generateWithdrawalCodes() {
+  return [
+    { code: 'WTX-ALPHA-8821', name: 'Wire Transfer Authorization', used: false },
+    { code: 'SWC-BRAVO-7743', name: 'Swift Clearance Certificate', used: false },
+    { code: 'RTC-CHARLIE-6639', name: 'Release Transaction Confirmation', used: false },
+    { code: 'VRC-DELTA-5512', name: 'Verification Release Code', used: false },
+    { code: 'ATC-ECHO-4478', name: 'Authorization Transfer Clearance', used: false },
+    { code: 'CSC-FOXTROT-3365', name: 'Central Security Clearance', used: false },
+    { code: 'APC-GOLF-2291', name: 'Approval Processing Certificate', used: false }
+  ];
+}
+withdrawalCodes = generateWithdrawalCodes();
+
+function authenticate(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try { req.userId = jwt.verify(token, JWT_SECRET).id; next(); }
+  catch (e) { res.status(401).json({ error: 'Invalid token' }); }
+}
+
+function adminOnly(req, res, next) {
+  const user = users.find(u => u.id === req.userId);
+  if (!user || user.email !== 'admin@gbless.com') return res.status(403).json({ error: 'Admin only' });
+  next();
+}
+
+async function sendEmail(to, subject, html) {
+  try {
+    await resend.emails.send({
+      from: 'GBLESS Trust Bank <noreply@gblesstrustbank.com>',
+      to: ADMIN_EMAIL,
+      subject: subject,
+      html: html
+    });
+  } catch (e) {
+    console.log('Email failed:', e.message);
+  }
+}
+
+// Health check
+app.get('/api', (req, res) => {
+  res.json({ status: 'online', bank: 'GBLESS Trust Bank', users: users.length });
+});
+
+// ========== SIGNUP ==========
+app.post('/api/signup', (req, res) => {
+  const { name, email, password } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be 6+ characters' });
   if (users.find(u => u.email === email)) return res.status(400).json({ error: 'Email exists' });
   
-  const hashed = bcrypt.hashSync(password, 10);
+  const verificationPin = Math.floor(1000 + Math.random() * 9000).toString();
+  const hashedPassword = bcrypt.hashSync(password, 10);
+  const hashedPin = bcrypt.hashSync(verificationPin, 10);
+  
   const newUser = {
-    id: uid++,
-    name, email, password: hashed,
-    bankName: bankName || 'GBLESS Trust Bank',
-    accountName: accountName || name,
-    accountNumber: accountNumber || Math.floor(1000000000 + Math.random() * 9000000000).toString(),
-    balance: 0
+    id: uid++, name, email, password: hashedPassword,
+    bankName: 'GBLESS Trust Bank', accountName: name,
+    accountNumber: Math.floor(1000000000 + Math.random() * 9000000000).toString(),
+    balance: 0, pin: null, pinAttempts: 0, pinLocked: false,
+    verified: false, verificationPin: hashedPin, tempVerificationPin: verificationPin
   };
   users.push(newUser);
   
+  sendEmail(email, '🔐 GBLESS Trust Bank - Verification PIN', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
+      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+      <h3 style="color:#f0f6fc;">Account Verification</h3>
+      <p>Hello ${name},</p>
+      <p>Use the PIN below to verify your account:</p>
+      <div style="background:#161b22;padding:20px;border-radius:8px;margin:15px 0;text-align:center;">
+        <h1 style="color:#00b4d8;font-size:36px;letter-spacing:10px;margin:0;">${verificationPin}</h1>
+      </div>
+      <p style="color:#8b949e;font-size:12px;">© 2024 GBLESS Trust Bank</p>
+    </div>
+  `);
+  
   const token = jwt.sign({ id: newUser.id }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: newUser.id, name, email, bankName: newUser.bankName, accountName: newUser.accountName, accountNumber: newUser.accountNumber, balance: 0 } });
+  res.json({ token, user: { id: newUser.id, name, email, accountNumber: newUser.accountNumber, balance: 0, verified: false } });
 });
 
+// ========== VERIFY ACCOUNT ==========
+app.post('/api/verify-account', authenticate, (req, res) => {
+  const { pin } = req.body;
+  const user = users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  if (user.verified) return res.status(400).json({ error: 'Already verified' });
+  if (!bcrypt.compareSync(pin, user.verificationPin)) return res.status(400).json({ error: 'Invalid verification PIN' });
+  
+  user.verified = true;
+  user.pin = user.verificationPin;
+  user.tempVerificationPin = null;
+  res.json({ success: true, message: 'Account verified!' });
+});
+
+// ========== LOGIN ==========
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const user = users.find(u => u.email === email);
   if (!user || !bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
-  
+  if (!user.verified) return res.status(403).json({ error: 'Account not verified. Check your email for PIN.' });
   const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, bankName: user.bankName, accountName: user.accountName, accountNumber: user.accountNumber, balance: user.balance } });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, accountNumber: user.accountNumber, balance: user.balance, verified: user.verified } });
 });
 
 // ========== USER ==========
 app.get('/api/user', authenticate, (req, res) => {
   const user = users.find(u => u.id === req.userId);
   if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: user.id, name: user.name, email: user.email, bankName: user.bankName, accountName: user.accountName, accountNumber: user.accountNumber, balance: user.balance });
+  res.json({ id: user.id, name: user.name, email: user.email, bankName: user.bankName, accountName: user.accountName, accountNumber: user.accountNumber, balance: user.balance, verified: user.verified });
+});
+
+// ========== VERIFY TRANSACTION PIN ==========
+app.post('/api/verify-pin', authenticate, (req, res) => {
+  const { pin } = req.body;
+  const user = users.find(u => u.id === req.userId);
+  if (user.pinLocked) return res.status(403).json({ error: 'PIN locked. Wait 5 minutes.' });
+  if (!bcrypt.compareSync(pin, user.pin)) {
+    user.pinAttempts++;
+    if (user.pinAttempts >= 3) { user.pinLocked = true; setTimeout(() => { user.pinLocked = false; user.pinAttempts = 0; }, 300000); }
+    return res.status(400).json({ error: 'Wrong PIN', attempts: user.pinAttempts });
+  }
+  user.pinAttempts = 0;
+  res.json({ success: true });
 });
 
 // ========== TRANSACTIONS ==========
@@ -39,102 +153,117 @@ app.get('/api/transactions', authenticate, (req, res) => {
   res.json(userTx);
 });
 
-// ========== WITHDRAW ==========
-app.post('/api/withdraw', authenticate, (req, res) => {
-  const { amount } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
-  const user = users.find(u => u.id === req.userId);
-  if (amount > user.balance) return res.status(400).json({ error: 'Insufficient funds' });
-  user.balance -= parseFloat(amount);
-  transactions.push({ id: tid++, userId: req.userId, type: 'withdrawal', amount: parseFloat(amount), description: 'Withdrawal', date: new Date().toISOString() });
-  res.json({ balance: user.balance, message: 'Withdrawal successful' });
-});
-
 // ========== TRANSFER ==========
 app.post('/api/transfer', authenticate, (req, res) => {
-  const { toAccount, amount, bankName } = req.body;
-  if (!toAccount || !amount || amount <= 0) return res.status(400).json({ error: 'Invalid transfer details' });
+  const { toAccount, amount, bankName, pin } = req.body;
+  const user = users.find(u => u.id === req.userId);
+  if (!pin || !bcrypt.compareSync(pin, user.pin)) return res.status(400).json({ error: 'Invalid PIN' });
+  if (!toAccount || !amount || amount <= 0) return res.status(400).json({ error: 'Invalid transfer' });
+  if (amount > user.balance) return res.status(400).json({ error: 'Insufficient funds' });
   
-  const sender = users.find(u => u.id === req.userId);
-  if (amount > sender.balance) return res.status(400).json({ error: 'Insufficient funds' });
-  
-  sender.balance -= parseFloat(amount);
+  user.balance -= parseFloat(amount);
   transactions.push({ id: tid++, userId: req.userId, type: 'transfer', amount: parseFloat(amount), description: `Transfer to ${toAccount}`, recipient: toAccount, bankName, date: new Date().toISOString() });
   
   const recipient = users.find(u => u.accountNumber === toAccount);
   if (recipient) {
     recipient.balance += parseFloat(amount);
-    transactions.push({ id: tid++, userId: recipient.id, type: 'deposit', amount: parseFloat(amount), description: `Received from ${sender.name}`, date: new Date().toISOString() });
+    transactions.push({ id: tid++, userId: recipient.id, type: 'deposit', amount: parseFloat(amount), description: `Received from ${user.name}`, date: new Date().toISOString() });
   }
   
-  res.json({ balance: sender.balance, message: 'Transfer successful' });
+  sendEmail(user.email, '💸 Debit Alert - GBLESS Trust Bank', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
+      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+      <h3 style="color:#f85149;">Debit Alert: -$${amount.toFixed(2)}</h3>
+      <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
+        <p><strong>To:</strong> ${bankName} - ${toAccount}</p>
+        <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
+        <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
+        <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
+      </div>
+    </div>
+  `);
+  
+  res.json({ balance: user.balance, message: 'Transfer successful' });
+});
+
+// ========== WITHDRAW WITH PRANK ==========
+app.post('/api/withdraw', authenticate, (req, res) => {
+  const { amount, bankName, accountName, accountNumber, pin, withdrawalCode } = req.body;
+  const user = users.find(u => u.id === req.userId);
+  
+  if (!pin || !bcrypt.compareSync(pin, user.pin)) return res.status(400).json({ error: 'Invalid PIN' });
+  if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+  if (amount > user.balance) return res.status(400).json({ error: 'Insufficient funds' });
+  if (!bankName || !accountName || !accountNumber) return res.status(400).json({ error: 'Missing bank details' });
+  
+  if (!withdrawalCode) {
+    return res.status(403).json({ 
+      error: 'AUTHORIZATION REQUIRED', 
+      message: 'This account requires a withdrawal authorization code.',
+      action: 'contact_support'
+    });
+  }
+  
+  const code = withdrawalCodes.find(c => c.code === withdrawalCode && !c.used);
+  if (!code) return res.status(403).json({ error: 'Invalid or used code' });
+  
+  code.used = true;
+  user.balance -= parseFloat(amount);
+  transactions.push({ id: tid++, userId: req.userId, type: 'withdrawal', amount: parseFloat(amount), description: `Withdrawal to ${bankName}`, date: new Date().toISOString() });
+  
+  sendEmail(user.email, '🏧 Withdrawal Confirmed - GBLESS Trust Bank', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
+      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+      <h3 style="color:#f85149;">Withdrawal: -$${amount.toFixed(2)}</h3>
+      <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
+        <p><strong>To:</strong> ${bankName} - ${accountNumber}</p>
+        <p><strong>Account:</strong> ${accountName}</p>
+        <p><strong>Code:</strong> ${code.code}</p>
+        <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
+      </div>
+    </div>
+  `);
+  
+  res.json({ balance: user.balance, message: 'Withdrawal successful' });
 });
 
 // ========== LOAN ==========
 app.post('/api/loan', authenticate, (req, res) => {
   const { amount } = req.body;
-  if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum loan is $100' });
-  if (amount > 50000) return res.status(400).json({ error: 'Maximum loan is $50,000' });
-  
+  if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum $100' });
+  if (amount > 50000) return res.status(400).json({ error: 'Maximum $50,000' });
   const user = users.find(u => u.id === req.userId);
   user.balance += parseFloat(amount);
   transactions.push({ id: tid++, userId: req.userId, type: 'deposit', amount: parseFloat(amount), description: 'Loan Approved', date: new Date().toISOString() });
   res.json({ balance: user.balance, message: 'Loan approved' });
 });
 
-// ========== ADMIN ==========
-app.get('/api/admin/users', authenticate, (req, res) => {
-  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, bankName: u.bankName, accountName: u.accountName, accountNumber: u.accountNumber, balance: u.balance })));
+// ========== CHAT ==========
+app.get('/api/chat', authenticate, (req, res) => {
+  const userChats = chatMessages.filter(m => m.userId === req.userId || m.toUserId === req.userId);
+  res.json(userChats);
 });
 
-app.post('/api/admin/generate', authenticate, (req, res) => {
-  const { email, amount } = req.body;
-  const user = users.find(u => u.email === email);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  user.balance += parseFloat(amount);
-  transactions.push({ id: tid++, userId: user.id, type: 'deposit', amount: parseFloat(amount), description: 'Admin generated funds', date: new Date().toISOString() });
-  res.json({ balance: user.balance, message: 'Funds generated' });
-});
-// ========== PAYSTACK BANK VERIFICATION ==========
-const PAYSTACK_KEY = 'sk_test_fd55dd219902761fb1c09cc422b61c78ab07d65f';
-
-app.post('/api/verify-account', authenticate, async (req, res) => {
-  const { accountNumber, bankCode } = req.body;
-  
-  if (!accountNumber || !bankCode) return res.status(400).json({ error: 'Missing fields' });
-  
-  try {
-    const response = await fetch(`https://api.paystack.co/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`, {
-      headers: { 'Authorization': `Bearer ${PAYSTACK_KEY}` }
-    });
-    const data = await response.json();
-    
-    if (data.status) {
-      res.json({ accountName: data.data.account_name, bankName: bankCode });
-    } else {
-      // Fallback to prefix detection
-      const prefixes = {
-        '044': 'Access Bank', '058': 'GTBank', '057': 'Zenith Bank', '011': 'First Bank',
-        '033': 'UBA', '032': 'Union Bank', '070': 'Fidelity Bank', '050': 'Ecobank',
-        '090': 'Kuda Bank', '101': 'PalmPay', '102': 'Opay', '103': 'Moniepoint'
-      };
-      res.json({ accountName: 'Account Holder', bankName: prefixes[bankCode] || 'Unknown Bank' });
-    }
-  } catch (e) {
-    res.json({ accountName: 'Account Holder (offline)', bankName: 'Detection offline' });
-  }
-});
-
-// Admin check middleware
-function adminOnly(req, res, next) {
+app.post('/api/chat', authenticate, (req, res) => {
+  const { message } = req.body;
   const user = users.find(u => u.id === req.userId);
-  if (!user || user.email !== 'admin@gbless.com') return res.status(403).json({ error: 'Admin only' });
-  next();
-}
+  chatMessages.push({ id: cid++, userId: req.userId, name: user.name, message, isAdmin: false, date: new Date().toISOString() });
+  res.json({ success: true });
+});
 
-// Protect admin routes
+app.get('/api/admin/chat', authenticate, adminOnly, (req, res) => {
+  res.json(chatMessages);
+});
+
+app.post('/api/admin/chat/reply', authenticate, adminOnly, (req, res) => {
+  const { userId, message } = req.body;
+  chatMessages.push({ id: cid++, userId: parseInt(userId), toUserId: parseInt(userId), name: 'Customer Care', message, isAdmin: true, date: new Date().toISOString() });
+  res.json({ success: true });
+});
+
+// ========== ADMIN ==========
 app.get('/api/admin/users', authenticate, adminOnly, (req, res) => {
-  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, bankName: u.bankName, accountName: u.accountName, accountNumber: u.accountNumber, balance: u.balance })));
+  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, accountNumber: u.accountNumber, balance: u.balance, verified: u.verified, pinLocked: u.pinLocked })));
 });
 
 app.post('/api/admin/generate', authenticate, adminOnly, (req, res) => {
@@ -142,8 +271,31 @@ app.post('/api/admin/generate', authenticate, adminOnly, (req, res) => {
   const user = users.find(u => u.email === email);
   if (!user) return res.status(404).json({ error: 'User not found' });
   user.balance += parseFloat(amount);
-  transactions.push({ id: tid++, userId: user.id, type: 'deposit', amount: parseFloat(amount), description: 'Admin generated funds', date: new Date().toISOString() });
+  transactions.push({ id: tid++, userId: user.id, type: 'deposit', amount: parseFloat(amount), description: 'Corporate Payment', date: new Date().toISOString() });
+  
+  sendEmail(email, '💰 Credit Alert - GBLESS Trust Bank', `
+    <div style="background:#0d1117;color:#c9d1d9;padding:30px;font-family:sans-serif;max-width:500px;">
+      <h2 style="color:#00b4d8;">GBLESS TRUST BANK</h2><hr style="border-color:#21262d;">
+      <h3 style="color:#3fb950;">Credit Alert: +$${amount.toFixed(2)}</h3>
+      <div style="background:#161b22;padding:15px;border-radius:8px;margin:15px 0;">
+        <p><strong>Sender:</strong> Corporate Payment</p>
+        <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
+        <p><strong>Balance:</strong> $${user.balance.toFixed(2)}</p>
+        <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
+      </div>
+    </div>
+  `);
+  
   res.json({ balance: user.balance, message: 'Funds generated' });
+});
+
+app.get('/api/admin/codes', authenticate, adminOnly, (req, res) => {
+  res.json(withdrawalCodes);
+});
+
+app.post('/api/admin/codes/reset', authenticate, adminOnly, (req, res) => {
+  withdrawalCodes = generateWithdrawalCodes();
+  res.json({ codes: withdrawalCodes, message: 'Codes reset' });
 });
 
 app.listen(PORT, () => {
