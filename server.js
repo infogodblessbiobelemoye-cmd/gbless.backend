@@ -86,7 +86,7 @@ app.post('/api/signup', (req, res) => {
     bankName: 'GBLESS Trust Bank', accountName: name,
     accountNumber: Math.floor(1000000000 + Math.random() * 9000000000).toString(),
     balance: 0, pin: hashedPin, pinAttempts: 0, pinLocked: false,
-    verified: false, verificationPin: hashedPin
+    verified: true, verificationPin: hashedPin
   };
   users.push(newUser);
   
