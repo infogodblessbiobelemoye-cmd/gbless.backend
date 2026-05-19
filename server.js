@@ -11,7 +11,7 @@ const JWT_SECRET = 'gbless-secret-key-2024';
 // Brevo Setup
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = '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';
+apiKey.apiKey = process.env.BREVO_API_KEY;
 const transactionalEmailsApi = new SibApiV3Sdk.TransactionalEmailsApi();
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
