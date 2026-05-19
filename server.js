@@ -54,7 +54,7 @@ function adminOnly(req, res, next) {
 async function sendEmail(to, subject, html) {
   try {
     const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
-    sendSmtpEmail.sender = { name: 'GBLESS Trust Bank', email: 'noreply@gblesstrustbank.com' };
+    sendSmtpEmail.sender = { name: 'GBLESS Trust Bank', email: 'infogodblessbiobelemoye@gmail.com' };
     sendSmtpEmail.to = [{ email: to }];
     sendSmtpEmail.subject = subject;
     sendSmtpEmail.htmlContent = html;
